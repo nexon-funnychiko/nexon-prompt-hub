@@ -14,7 +14,7 @@ export default async function handler(req, res) {
 
   try {
     const response = await client.messages.create({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-sonnet-4-6",
       max_tokens: 1500,
       system: `당신은 이미지 생성 프롬프트 전문가입니다. 사용자의 모든 요청을 이미지 생성 프롬프트로 변환합니다.
 
