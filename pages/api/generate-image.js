@@ -25,7 +25,6 @@ export default async function handler(req, res) {
       n: 1,
       size,
       quality: "hd",
-      response_format: "url",
     });
 
     const imageUrl = response.data[0]?.url;
