@@ -18,10 +18,9 @@ export default async function handler(req, res) {
   if (!FIGMA_TOKEN) return res.status(500).json({ error: "FIGMA_ACCESS_TOKEN 환경변수가 없습니다." });
 
   try {
+    // 1단계: Figma 파일 구조 가져오기
     const figmaRes = await fetch(
-      nodeId
-        ? `https://api.figma.com/v1/files/${fileKey}/nodes?ids=${encodeURIComponent(nodeId)}`
-        : `https://api.figma.com/v1/files/${fileKey}`,
+      `https://api.figma.com/v1/files/${fileKey}`,
       { headers: { "X-Figma-Token": FIGMA_TOKEN } }
     );
     const figmaData = await figmaRes.json();
@@ -29,50 +28,113 @@ export default async function handler(req, res) {
 
     const fileName = figmaData.name || "Figma 파일";
 
-    let screenshotUrl = null;
-    try {
-      const targetNodeId = nodeId || "0:1";
-      const imgRes = await fetch(
-        `https://api.figma.com/v1/images/${fileKey}?ids=${encodeURIComponent(targetNodeId)}&format=png&scale=2`,
-        { headers: { "X-Figma-Token": FIGMA_TOKEN } }
-      );
-      const imgData = await imgRes.json();
-      screenshotUrl = imgData.images?.[targetNodeId] || Object.values(imgData.images || {})[0] || null;
-    } catch (e) {
-      console.warn("Image fetch failed:", e.message);
+    // 2단계: 프레임 목록 추출 (최대 10개)
+    const frames = [];
+    const extractFrames = (node, depth = 0) => {
+      if (depth > 3) return;
+      if ((node.type === "FRAME" || node.type === "COMPONENT" || node.type === "GROUP") && node.id) {
+        frames.push({ id: node.id, name: node.name || "Frame" });
+      }
+      if (frames.length >= 10) return;
+      if (node.children) {
+        node.children.forEach(child => extractFrames(child, depth + 1));
+      }
+    };
+
+    if (figmaData.document) {
+      figmaData.document.children?.forEach(page => {
+        page.children?.forEach(node => extractFrames(node));
+      });
     }
 
-    const contentBlocks = [];
-    if (screenshotUrl) {
-      contentBlocks.push({ type: "image", source: { type: "url", url: screenshotUrl } });
+    // nodeId가 있으면 해당 노드만
+    const targetFrames = nodeId
+      ? [{ id: nodeId, name: "선택된 프레임" }]
+      : frames.slice(0, 6);
+
+    if (targetFrames.length === 0) {
+      targetFrames.push({ id: "0:1", name: "전체" });
     }
-    contentBlocks.push({
-      type: "text",
-      text: `Figma 파일명: ${fileName}
-${screenshotUrl ? "위 스크린샷을 분석하고, " : ""}아래 구조 데이터를 바탕으로 이미지 생성에 활용할 스타일 가이드를 한국어로 작성해줘.
 
-Figma 데이터: ${JSON.stringify(figmaData).slice(0, 2000)}
+    // 3단계: 각 프레임 이미지 URL 가져오기 (scale=0.5 → 크기 문제 해결)
+    const frameIds = targetFrames.map(f => f.id).join(",");
+    const imgRes = await fetch(
+      `https://api.figma.com/v1/images/${fileKey}?ids=${encodeURIComponent(frameIds)}&format=png&scale=0.5`,
+      { headers: { "X-Figma-Token": FIGMA_TOKEN } }
+    );
+    const imgData = await imgRes.json();
+    const imageUrls = imgData.images || {};
 
-다음 항목을 포함해줘:
-1. 전체 아트 스타일과 분위기
-2. 주요 색상 팔레트
-3. 캐릭터/오브젝트 디자인 특징
-4. 구도와 레이아웃 특징
-5. 이미지 생성 프롬프트 키워드`,
-    });
+    // 4단계: 각 프레임을 Claude Vision으로 분석
+    const analyses = [];
+    for (const frame of targetFrames) {
+      const imgUrl = imageUrls[frame.id];
+      if (!imgUrl) continue;
 
-    const analysisRes = await client.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 2000,
-      messages: [{ role: "user", content: contentBlocks }],
-    });
-
-    const analysisText = analysisRes.content.find((b) => b.type === "text")?.text || "";
-
-    let screenshotBase64 = null;
-    if (screenshotUrl) {
       try {
-        const imgFetch = await fetch(screenshotUrl);
+        const contentBlocks = [
+          { type: "image", source: { type: "url", url: imgUrl } },
+          {
+            type: "text",
+            text: `이 Figma 프레임("${frame.name}")을 게임 개발 관점에서 분석해줘.
+
+다음을 포함해서 한국어로 작성:
+1. 아트 스타일 (애니메이션/사실적/픽셀아트/3D렌더링 등)
+2. 색상 팔레트 (주요 색상, 분위기)
+3. 캐릭터 특징 (있다면): 외형, 의상, 포즈, 표정
+4. 배경 특징 (있다면): 장르, 시대, 환경, 원근감
+5. AI 이미지 생성에 바로 쓸 수 있는 영문 키워드 10개
+
+영문 키워드는 반드시 포함해줘.`
+          }
+        ];
+
+        const analysisRes = await client.messages.create({
+          model: "claude-sonnet-4-6",
+          max_tokens: 800,
+          messages: [{ role: "user", content: contentBlocks }],
+        });
+
+        const analysisText = analysisRes.content.find(b => b.type === "text")?.text || "";
+        analyses.push({ frameName: frame.name, analysis: analysisText, imageUrl: imgUrl });
+      } catch (e) {
+        console.warn(`Frame ${frame.name} analysis failed:`, e.message);
+      }
+    }
+
+    // 5단계: 텍스트 컨텐츠 추출
+    const textContent = [];
+    const extractText = (node, depth = 0) => {
+      if (depth > 4) return;
+      if (node.type === "TEXT" && node.characters) {
+        textContent.push(node.characters.slice(0, 200));
+      }
+      if (node.children) {
+        node.children.forEach(child => extractText(child, depth + 1));
+      }
+    };
+    if (figmaData.document) {
+      figmaData.document.children?.forEach(page => extractText(page));
+    }
+
+    // 6단계: 통합 컨텍스트 생성
+    const combinedContext = [
+      `=== Figma 파일: ${fileName} ===`,
+      `총 ${analyses.length}개 프레임 분석 완료`,
+      "",
+      ...analyses.map((a, i) =>
+        `[프레임 ${i + 1}: ${a.frameName}]\n${a.analysis}`
+      ),
+      textContent.length > 0
+        ? `\n=== 텍스트 내용 ===\n${textContent.slice(0, 20).join("\n")}`
+        : "",
+    ].filter(Boolean).join("\n\n");
+
+    // 대표 스크린샷 (첫 번째 프레임)
+    let screenshotBase64 = null;
+    if (analyses[0]?.imageUrl) {
+      try {
+        const imgFetch = await fetch(analyses[0].imageUrl);
         const imgBuffer = await imgFetch.arrayBuffer();
         screenshotBase64 = Buffer.from(imgBuffer).toString("base64");
       } catch (e) {
@@ -82,10 +144,12 @@ Figma 데이터: ${JSON.stringify(figmaData).slice(0, 2000)}
 
     res.status(200).json({
       title: fileName,
-      context: analysisText,
+      context: combinedContext,
+      frameCount: analyses.length,
       screenshotBase64,
       screenshotMediaType: "image/png",
     });
+
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
