@@ -62,7 +62,7 @@ Figma 데이터: ${JSON.stringify(figmaData).slice(0, 2000)}
     });
 
     const analysisRes = await client.messages.create({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-sonnet-4-6",
       max_tokens: 2000,
       messages: [{ role: "user", content: contentBlocks }],
     });
